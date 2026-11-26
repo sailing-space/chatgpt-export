@@ -87,16 +87,16 @@
   // drawing elements and presentation/geometry attributes from response text.
   function safeInlineSvg(svg) {
     const tags = new Set(["svg", "g", "rect", "circle", "ellipse", "line", "polyline", "polygon", "path", "text", "tspan"]);
-    const attrs = new Set(["xmlns", "viewBox", "width", "height", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy", "r", "rx", "ry", "d", "points", "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "opacity", "transform", "font-size", "text-anchor"]);
+    const attrs = new Set(["xmlns", "viewBox", "width", "height", "x", "y", "x1", "x2", "y1", "y2", "cx", "cy", "r", "rx", "ry", "d", "points", "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "opacity", "transform", "font-size", "font-weight", "text-anchor", "fill-opacity", "stroke-opacity"]);
     return String(svg || "").replace(/<\/?([\w:-]+)\b([^>]*)>/g, (whole, rawTag, rawAttrs) => {
       const tag = rawTag.toLowerCase();
       if (!tags.has(tag)) return "";
       if (whole.startsWith("</")) return `</${tag}>`;
       const safeAttrs = [];
       for (const match of rawAttrs.matchAll(/([\w:-]+)\s*=\s*(["'])(.*?)\2/gs)) {
-        const name = match[1];
+        const name = match[1].replace(/[A-Z]/g, c => `-${c.toLowerCase()}`).replace(/^view-box$/, "viewBox");
         const value = match[3];
-        if (!attrs.has(name) || /[<>]|javascript:|https?:/i.test(value)) continue;
+        if (!attrs.has(name) || /[<>]|javascript:|https?:|url\s*\(/i.test(value)) continue;
         safeAttrs.push(`${name}="${esc(value)}"`);
       }
       return `<${tag}${safeAttrs.length ? ` ${safeAttrs.join(" ")}` : ""}${/\/\s*>$/.test(whole) ? " />" : ">"}`;
@@ -550,8 +550,288 @@
     return { id, name, page, start, end, sandboxPath, messageId, urls };
   }
 
+  // Read serialized UI as data. This interpreter deliberately has no JavaScript
+  // execution, global lookup, assignment, or general-purpose function calls.
+  function uiBraceEnd(s, start) {
+    let depth = 0, quote = "";
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (quote) { if (c === "\\") i++; else if (c === quote) quote = ""; continue; }
+      if (/['"`]/.test(c)) quote = c;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) return i;
+    }
+    return -1;
+  }
+
+  function uiValue(source, scope = Object.create(null)) {
+    const s = source.trim(); let pos = 0, steps = 0;
+    const fail = () => { throw new Error("Unsupported static UI expression"); };
+    const ws = () => { while (/\s/.test(s[pos] || "") && pos < s.length) pos++; };
+    const take = token => { ws(); if (s.startsWith(token, pos)) { pos += token.length; return true; } return false; };
+    const name = () => { ws(); const m = s.slice(pos).match(/^[A-Za-z_]\w*/); if (!m) return fail(); pos += m[0].length; return m[0]; };
+    function atom() {
+      if (++steps > 4000) return fail();
+      ws(); let value;
+      const q = s[pos];
+      if (q === '"' || q === "'" || q === "`") {
+        pos++; value = "";
+        while (pos < s.length && s[pos] !== q) {
+          if (s[pos] === "\\") { pos++; const c = s[pos++]; value += ({n:"\n",r:"\r",t:"\t"})[c] ?? c; }
+          else if (q === "`" && s.startsWith("${", pos)) {
+            const end = uiBraceEnd(s, pos + 1); if (end < 0) return fail();
+            value += String(uiValue(s.slice(pos + 2, end), scope)); pos = end + 1;
+          } else value += s[pos++];
+        }
+        if (s[pos++] !== q) return fail();
+      } else if (take("[")) {
+        value = []; if (!take("]")) { do { if (value.length >= 100) return fail(); value.push(expr()); } while (take(",") && !s.slice(pos).trimStart().startsWith("]")); if (!take("]")) return fail(); }
+      } else if (take("{")) {
+        value = Object.create(null); if (!take("}")) { do {
+          ws(); const key = /['"]/.test(s[pos]) ? atom() : name();
+          if (["__proto__", "prototype", "constructor"].includes(key) || !take(":")) return fail();
+          value[key] = expr();
+        } while (take(",") && !s.slice(pos).trimStart().startsWith("}")); if (!take("}")) return fail(); }
+      } else if (take("(")) { value = expr(); if (!take(")")) return fail(); }
+      else if (take("-")) value = -atom();
+      else {
+        ws(); const n = s.slice(pos).match(/^\d+(?:\.\d+)?/);
+        if (n) { pos += n[0].length; value = Number(n[0]); }
+        else { const key = name(); if (key === "true") value = true; else if (key === "false") value = false; else if (key === "null") value = null; else if (Object.hasOwn(scope, key)) value = scope[key]; else return fail(); }
+      }
+      while (take(".")) {
+        const key = name();
+        if (key === "includes" && Array.isArray(value) && take("(")) { const item = expr(); if (!take(")")) return fail(); value = value.includes(item); }
+        else if (key === "length" && (Array.isArray(value) || typeof value === "string")) value = value.length;
+        else if (value && typeof value === "object" && Object.hasOwn(value, key)) value = value[key];
+        else return fail();
+      }
+      return value;
+    }
+    const precedence = {"===":1,"!==":1,"<":2,">":2,"<=":2,">=":2,"+":3,"-":3,"*":4,"/":4};
+    function binary(min = 0) {
+      let a = atom();
+      while (true) {
+        ws(); const op = s.slice(pos).match(/^(===|!==|<=|>=|[<>+*/-])/ )?.[0];
+        if (!op || precedence[op] < min) break;
+        pos += op.length; const b = binary(precedence[op] + 1);
+        a = op === "+" ? a+b : op === "-" ? a-b : op === "*" ? a*b : op === "/" ? a/b : op === "===" ? a===b : op === "!==" ? a!==b : op === "<" ? a<b : op === ">" ? a>b : op === "<=" ? a<=b : a>=b;
+      }
+      return a;
+    }
+    function expr() { const a = binary(); if (!take("?")) return a; const yes = expr(); if (!take(":")) return fail(); const no = expr(); return a ? yes : no; }
+    const result = expr(); ws(); if (pos !== s.length || (typeof result === "number" && !Number.isFinite(result))) return fail(); return result;
+  }
+
+  function expandStaticUi(source) {
+    const scope = Object.create(null);
+    // Strip handlers with balanced braces: a handler's arrow or string may
+    // contain '>', which cannot safely be matched with an HTML-tag regexp.
+    let clean = "";
+    for (let i = 0; i < source.length;) {
+      const handler = source.slice(i).match(/^\s+on[A-Z]\w*\s*=\s*/);
+      if (handler && source[i + handler[0].length] === "{") {
+        const end = uiBraceEnd(source, i + handler[0].length);
+        if (end >= 0) { i = end + 1; continue; }
+      }
+      if (source.startsWith("{@body", i)) {
+        const end = uiBraceEnd(source, i); if (end < 0) { clean += source[i++]; continue; }
+        const declaration = source.slice(i + 6, end).trim();
+        const state = declaration.match(/^const\s+\[([A-Za-z_]\w*),\s*\w+\]\s*=\s*DIL\.useState\(([\s\S]*)\)$/);
+        const constant = declaration.match(/^const\s+([A-Za-z_]\w*)\s*=\s*([\s\S]*)$/);
+        try { if (state || constant) { const m = state || constant; scope[m[1]] = uiValue(m[2], scope); i = end + 1; continue; } } catch (_) {}
+      }
+      clean += source[i++];
+    }
+    let budget = 0;
+    function expand(s, env, depth = 0) {
+      if (depth > 20 || (budget += s.length) > 2000000) return "[Static UI limit reached]";
+      let out = "";
+      for (let i = 0; i < s.length;) {
+        if (s[i] !== "{") { out += s[i++]; continue; }
+        const end = uiBraceEnd(s, i); if (end < 0) { out += s[i++]; continue; }
+        const raw = s.slice(i + 1, end), block = raw.match(/^#(each|if)\s+([\s\S]*)$/);
+        if (block) {
+          let nesting = 1, cursor = end + 1, otherwise = -1, close = -1, closeEnd = -1;
+          while (cursor < s.length) {
+            const start = s.indexOf("{", cursor); if (start < 0) break;
+            const stop = uiBraceEnd(s, start); if (stop < 0) break;
+            const directive = s.slice(start + 1, stop);
+            if (/^#(?:each|if)\s/.test(directive)) nesting++;
+            else if (/^\/(?:each|if)$/.test(directive) && --nesting === 0) { close = start; closeEnd = stop; break; }
+            else if (directive === ":else" && nesting === 1) otherwise = start;
+            cursor = stop + 1;
+          }
+          if (close >= 0) {
+            const body = s.slice(end + 1, otherwise < 0 ? close : otherwise);
+            try {
+              if (block[1] === "each") {
+                const m = block[2].match(/^([\s\S]*)\s+as\s+(\w+)(?:\s*,\s*(\w+))?$/); if (!m) throw Error();
+                const values = uiValue(m[1], env); if (!Array.isArray(values) || values.length > 100) throw Error();
+                out += values.map((v, index) => { const child = Object.assign(Object.create(null), env, {[m[2]]:v}); if (m[3]) child[m[3]]=index; return expand(body, child, depth + 1); }).join("\n");
+              } else out += expand(uiValue(block[2], env) ? body : otherwise < 0 ? "" : s.slice(otherwise + 7, close), env, depth + 1);
+              i = closeEnd + 1; continue;
+            } catch (_) { out += s.slice(i, closeEnd + 1); i = closeEnd + 1; continue; }
+          }
+        }
+        try {
+          const value = uiValue(raw, env);
+          // Attribute expressions become quoted, escaped scalar attributes.
+          if (/=\s*$/.test(out)) out += `"${esc(typeof value === "object" ? JSON.stringify(value) : value)}"`;
+          else if (typeof value !== "object") out += esc(value);
+          else out += s.slice(i, end + 1);
+        } catch (_) { out += s.slice(i, end + 1); }
+        i = end + 1;
+      }
+      return out;
+    }
+    return expand(clean, scope);
+  }
+
+  // Interpret a small, static UI vocabulary only. Never evaluate expressions or
+  // accept response-provided HTML, CSS, event handlers or SVG paths.
+  function staticUi(text, htmlMode, keep) {
+    const saved = new Map();
+    const protect = (value) => {
+      const key = `CGXUICOD${saved.size}Z`;
+      saved.set(key, value);
+      return key;
+    };
+    let source = String(text || "").replace(/(^ {0,3}(`{3,}|~{3,})[^\n]*\n)[\s\S]*?^ {0,3}\2[^\n]*(?:\n|$)|(`+)[^\n]*?\3/gm, protect);
+    source = expandStaticUi(source);
+    const attr = (raw, name) => (raw.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|\\{(\\d+(?:\\.\\d+)?)\\}|([^\\s>]+))`, "i"))?.slice(1).find(value => value !== undefined) || "").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    const spacing = value => /^\d+(?:\.\d+)?$/.test(value) ? `${Math.min(24, Number(value)) * 4}px` : "8px";
+    const colors = { tertiary: "#71717a", secondary: "#71717a", info: "#2563eb", success: "#16a34a", warning: "#d97706", danger: "#dc2626", surface: "var(--cgx-ui-surface,#e4e4e7)", "surface-secondary": "var(--cgx-ui-secondary,#f4f4f5)", "surface-tertiary": "var(--cgx-ui-tertiary,#d4d4d8)" };
+    const color = value => colors[value] || (/^(?:#[0-9a-f]{3,8}|rgba?\([\d.,\s]+\))$/i.test(value) ? value : "");
+    const length = value => /^(?:\d+(?:\.\d+)?)(?:px|%|rem|em)$/.test(value) ? value : "";
+    source = source.replace(/<Chart\b([^<>]*)\/\s*>/g, (whole, raw) => {
+      try {
+        const chart = JSON.parse(attr(raw, "content"));
+        if (chart.chartType !== "bar" || !Array.isArray(chart.data) || chart.data.length > 100 || !Array.isArray(chart.series) || chart.series.length > 10) return whole;
+        const series = chart.series, data = chart.data;
+        const values = data.flatMap(row => series.map(s => Number(row[s.dataKey])));
+        if (!values.length || !values.every(Number.isFinite)) return whole;
+        const min = Number(chart.yAxisMin ?? Math.min(0, ...values)), max = Number(chart.yAxisMax ?? Math.max(1, ...values));
+        if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return whole;
+        if (!htmlMode) return `\n\n| ${mdLabel(chart.xKey)} | ${series.map(s => mdLabel(s.label || s.dataKey)).join(" | ")} |\n| ${[chart.xKey,...series].map(() => "---").join(" | ")} |\n${data.map(row => `| ${mdLabel(row[chart.xKey])} | ${series.map(s => mdLabel(row[s.dataKey])).join(" | ")} |`).join("\n")}\n\n${chart.meta?.footer || ""}\n\n`;
+        const y = v => 300 - Math.max(0, Math.min(1, (v-min)/(max-min))) * 260;
+        let svg = '<svg role="img" aria-label="Bar chart" viewBox="0 0 680 350" width="100%">';
+        for (let i=0;i<=4;i++) { const v=min+(max-min)*i/4, yy=y(v); svg += `<path d="M45 ${yy}H665" stroke="currentColor" opacity=".12"/><text x="35" y="${yy+4}" text-anchor="end" fill="currentColor" font-size="12">${esc(Math.round(v*100)/100)}</text>`; }
+        data.forEach((row,i) => { const group=610/data.length, w=group*.55/series.length; series.forEach((s,j) => { const v=Number(row[s.dataKey]), yy=y(v), zero=y(0); svg += `<rect x="${50+i*group+group*.2+j*w}" y="${Math.min(yy,zero)}" width="${w}" height="${Math.abs(zero-yy)}" rx="5" fill="${["#2563eb","#0d9488","#d97706"][j%3]}"><title>${esc(row[chart.xKey])}: ${esc(s.label || s.dataKey)} ${v}</title></rect>`; }); svg += `<text x="${50+(i+.5)*group}" y="325" text-anchor="middle" fill="currentColor" font-size="13">${esc(row[chart.xKey])}</text>`; });
+        return keep(`<figure style="margin:0">${svg}</svg><figcaption>${esc(chart.meta?.footer || "")}</figcaption></figure>`, true);
+      } catch (_) { return whole; }
+    });
+    source = source.replace(/<svg\b[\s\S]*?<\/svg\s*>/gi, svg => htmlMode ? keep(safeInlineSvg(svg), true) : "\n\n[Diagram available in the HTML export.]\n\n");
+    source = source.replace(/<segmented-control\b([^<>]*)\/\s*>/g, (_m, raw) => {
+      try { const options = JSON.parse(attr(raw,"options")); if (!Array.isArray(options)) throw Error(); return htmlMode ? keep(`<div style="display:flex;gap:8px">${options.slice(0,20).map(o => `<span style="flex:1;text-align:center;border-radius:999px;padding:6px;border:1px solid #71717a;${o.value===attr(raw,"value") ? 'background:#71717a33;font-weight:700' : ''}">${esc(o.label)}</span>`).join("")}</div>`,true) : options.map(o => o.label).join(" / "); } catch (_) { return ""; }
+    });
+    const paths = {
+      "arrow-down": '<path d="M12 4v16m-6-6 6 6 6-6"/>',
+      camera: '<rect x="3" y="6" width="18" height="15" rx="2"/><path d="m8 6 2-3h4l2 3"/><circle cx="12" cy="13" r="4"/>',
+      "code-xml": '<path d="m8 5-6 7 6 7m8-14 6 7-6 7m-3-16-2 18"/>',
+      "layout-template": '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 9v12"/>',
+      "notebook-pen": '<path d="M14 3H5v18h14v-8M2 7h6M2 12h6M2 17h6m7-8 5-5 2 2-5 5-3 1z"/>',
+      "file-down": '<path d="M14 2H4v20h16V8zM14 2v6h6M12 11v7m-3-3 3 3 3-3"/>',
+      archive: '<rect x="3" y="3" width="18" height="5" rx="1"/><path d="M5 8v13h14V8m-10 4h6"/>',
+      "arrow-right": '<path d="M4 12h16m-6-6 6 6-6 6"/>',
+      "file-text": '<path d="M14 2H4v20h16V8zM14 2v6h6M8 12h8M8 16h8"/>',
+      "file-code": '<path d="M14 2H4v20h16V8zM14 2v6h6m-10 4-3 3 3 3m4-6 3 3-3 3"/>',
+      "file-code-2": '<path d="M14 2H4v20h16V8zM14 2v6h6m-10 4-3 3 3 3m4-6 3 3-3 3"/>',
+      "folder-down": '<path d="M3 7V4h6l3 3h9v14H3zM12 10v8m-3-3 3 3 3-3"/>',
+      "check-circle": '<circle cx="12" cy="12" r="9"/><path d="m7 12 3 3 7-7"/>',
+      "check-circle-2": '<circle cx="12" cy="12" r="9"/><path d="m7 12 3 3 7-7"/>',
+      "pencil-line": '<path d="m4 16 12-12 4 4L8 20H4zm10-10 4 4M12 21h9"/>',
+      pencil: '<path d="m4 16 12-12 4 4L8 20H4zm10-10 4 4"/>',
+      database: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/>',
+      "hard-drive": '<path d="m5 4-3 11v5h20v-5L19 4zM2 15h20M6 18h1m3 0h1"/>',
+      search: '<circle cx="10" cy="10" r="7"/><path d="m15 15 6 6"/>',
+      image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="2"/><path d="m3 17 6-6 4 4 3-3 5 5"/>',
+      images: '<rect x="7" y="3" width="14" height="14" rx="2"/><path d="M3 7v14h14M7 14l4-4 4 4 2-2 4 4"/>',
+      "file-image": '<path d="M14 2H4v20h16V8zM14 2v6h6m-14 10 4-5 3 3 2-2 3 4"/>',
+      copy: '<rect x="8" y="3" width="13" height="13" rx="2"/><path d="M16 16v5H3V8h5"/>',
+      "clock-3": '<circle cx="12" cy="12" r="9"/><path d="M12 6v6h5"/>'
+    };
+    source = source.replace(/<icon\b([^<>]*?)\/\s*>/gi, (_whole, raw) => {
+      const name = attr(raw, "name");
+      if (!htmlMode) return "";
+      if (!paths[name]) return keep(`<span class="cgx-ui-icon-label">[${esc(name || "icon")}]</span>`, false);
+      const size = { sm: 16, md: 20, lg: 28, xl: 36 }[attr(raw, "size")] || 20;
+      return keep(`<svg role="img" aria-label="${esc(name)}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${colors[attr(raw, "color")] || "currentColor"}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;flex-shrink:0">${paths[name]}</svg>`, false);
+    });
+    // Innermost-first replacement supports nested containers of the same type.
+    source = source.replace(/<(box)\b([^<>]*?)\/\s*>/gi, "<$1$2></$1>");
+    source = source.replace(/<radio-group\b([^<>]*)>([\s\S]*?)<\/radio-group>/gi, (_m, raw, body) => `<radio-group${raw}>${body.replace(/<radio\b([^<>]*)>/g, (_r, attrs) => `<radio${attrs}${attr(attrs,"value") === attr(raw,"value") ? ' checked="true"' : ''}>`)}</radio-group>`);
+    const paired = /<(grid|grid-item|row|box|text|title|caption|badge|button|checkbox|radio-group|radio)\b([^<>]*)>((?:(?!<\/?(?:grid|grid-item|row|box|text|title|caption|badge|button|checkbox|radio-group|radio)\b)[\s\S])*?)<\/\1\s*>/gi;
+    for (let depth = 0; depth < 32; depth++) {
+      let changed = false;
+      source = source.replace(paired, (_whole, tag, raw, body) => {
+        changed = true;
+        if (!htmlMode) return `\n\n${tag === "checkbox" ? "- [ ] " : ""}${body.trim()}\n\n`;
+        tag = tag.toLowerCase();
+        const styles = ["min-width:0", "box-sizing:border-box"];
+        if (tag === "grid") {
+          const columns = Math.max(1, Math.min(6, Number(attr(raw, "columns")) || 2));
+          styles.push("display:grid", `grid-template-columns:repeat(${columns},minmax(0,1fr))`);
+        } else if (tag === "row") {
+          styles.push("display:flex", "flex-wrap:wrap");
+          styles.push(`align-items:${{ center: "center", start: "flex-start", end: "flex-end" }[attr(raw, "align")] || "center"}`);
+          styles.push(`justify-content:${{ between: "space-between", center: "center", end: "flex-end" }[attr(raw, "justify")] || "flex-start"}`);
+        }
+        if (tag === "grid" || tag === "row" || tag === "box") styles.push(`gap:${spacing(attr(raw, "gap"))}`);
+        if (tag === "box" || tag === "radio-group") styles.push("display:flex", "flex-direction:column");
+        if (tag === "box") {
+          if (attr(raw,"align")==="center") styles.push("align-items:center", "text-align:center");
+          if (attr(raw,"justify")==="center") styles.push("justify-content:center");
+        }
+        if (/^\d+(?:\.\d+)?$/.test(attr(raw,"flex"))) styles.push(`flex:${attr(raw,"flex")}`);
+        for (const dimension of ["width","height"]) if (length(attr(raw,dimension))) styles.push(`${dimension}:${length(attr(raw,dimension))}`);
+        if (["text","title","caption"].includes(tag)) {
+          const sizes = {"2xs":".7em",xs:".8em",sm:".9em",lg:"1.15em",xl:"1.4em"};
+          if (sizes[attr(raw,"size")]) styles.push(`font-size:${sizes[attr(raw,"size")]}`);
+          if (attr(raw,"weight")==="medium" || tag==="title") styles.push("font-weight:600");
+          if (colors[attr(raw,"color")]) styles.push(`color:${colors[attr(raw,"color")]}`);
+          if (attr(raw,"textAlign")==="center") styles.push("text-align:center");
+        }
+        if (tag === "badge") styles.push("display:inline-block","border-radius:999px","padding:2px 8px","background:#71717a33","font-size:.8em");
+        if (tag === "button") styles.push("border:1px solid #71717a","border-radius:999px","padding:8px 16px","text-align:center","opacity:.8");
+        if (tag === "checkbox" || tag === "radio") body = keep(`<input type="${tag === "checkbox" ? "checkbox" : "radio"}" disabled${attr(raw,"checked")==="true" ? " checked" : ""}> `, false) + body;
+        if (attr(raw, "padding") || attr(raw, "p")) styles.push(`padding:${spacing(attr(raw, "padding") || attr(raw, "p"))}`);
+        if (tag === "grid-item") styles.push("padding:12px", "border:1px solid #a1a1aa", "border-radius:12px");
+        if (/(?:^|\s)border(?:\s|=|$)/i.test(raw)) styles.push("border:1px solid #a1a1aa");
+        if (attr(raw, "radius")) styles.push(`border-radius:${attr(raw, "radius") === "full" ? "9999px" : "12px"}`);
+        if (color(attr(raw, "background"))) styles.push(`background:${color(attr(raw, "background"))}`);
+        return keep(`<div class="cgx-ui-${tag}"${tag === "button" ? ' role="button" aria-disabled="true"' : ''} style="${styles.join(";")}">`, true) + body.trim() + keep("</div>", true);
+      });
+      if (!changed) break;
+    }
+    for (const [key, value] of saved) source = source.split(key).join(value);
+    return source;
+  }
+
   function renderRichText(text, refs, ctx, messageId = null, metadata = null) {
-    text = preprocessWritingBlocks(text, refs, metadata, ctx);
+    const codeTokens = new Map();
+    text = String(text || "").replace(/(^ {0,3}(`{3,}|~{3,})[^\n]*\n)[\s\S]*?^ {0,3}\2[^\n]*(?:\n|$)|(`+)[^\n]*?\3|<CodeBlock\b[^>]*>[\s\S]*?<\/CodeBlock>/gm, value => {
+      const component = value.match(/^<CodeBlock\b([^>]*)>([\s\S]*?)<\/CodeBlock>$/);
+      if (component) {
+        const [, attrs, body] = component;
+        const fence = "`".repeat(Math.max(3, ...[...body.matchAll(/`+/g)].map(m => m[0].length + 1)));
+        value = `\n\n${fence}${attrs.match(/language="([\w+-]+)"/)?.[1] || ""}\n${body.trim()}\n${fence}\n\n`;
+      }
+      const key = `CGXCODEBLOCK${codeTokens.size}Z`;
+      codeTokens.set(key, value);
+      return key;
+    });
+    const originalText = text;
+    const uiTokens = new Map();
+    const keepUi = (html, block) => {
+      const key = `CGXUIHTML${uiTokens.size}Z`;
+      uiTokens.set(key, html);
+      return block ? `\n\n${key}\n\n` : key;
+    };
+    // JEX already has a separate inline-HTML renderer; retain its established
+    // formatting instead of replacing its containers with portable Markdown.
+    const jexRich = metadata && metadata.jexRichHtml;
+    text = preprocessWritingBlocks(jexRich ? text : staticUi(text, false, keepUi), refs, metadata, ctx);
     // Sandbox links are files generated by ChatGPT. Replace them with a file
     // marker so content.js can try sandbox endpoints, then keep the original
     // link if no endpoint is available for the account.
@@ -560,7 +840,12 @@
       return `[${label}](${ph})`;
     });
     let md = text;
-    let src = text;
+    // Reuse preprocessing for citations/media while preserving the HTML layout.
+    let src = jexRich ? text : preprocessWritingBlocks(staticUi(originalText, true, keepUi), refs, metadata, ctx);
+    src = String(src).replace(/\[([^\]]+)\]\((sandbox:\/[^)]+)\)/g, (_m, label, url) => {
+      const ph = ctx.file([url], label || "file", { messageId, sandboxPath: url.replace(/^sandbox:/, "") });
+      return `[${label}](${ph})`;
+    });
     const tokens = new Map();
     const token = (html, block) => {
       const t = `CGXT${tokens.size}Z`;
@@ -680,9 +965,16 @@
       src = src.split(ref.matched_text).join(srcOut);
     }
 
+    for (const [key, value] of codeTokens) {
+      md = md.split(key).join(value);
+      src = src.split(key).join(value);
+    }
     md = sanitizeMarkdownLinks(clean(md)).replace(/ {2,}\(\[/g, " ([").replace(/\n{3,}/g, "\n\n").trim();
     let html = markedLib.parse(sanitizeMarkdownLinks(clean(src)).replace(/ {2,}(CGXT\d+Z)/g, " $1").trim());
     for (const [t, h] of tokens) html = html.split(`<p>${t}</p>`).join(h).split(t).join(h);
+    // Parents are created after children; restore in reverse order so nested
+    // cards and icons are expanded too.
+    for (const [t, h] of [...uiTokens].reverse()) html = html.split(`<p>${t}</p>`).join(h).split(t).join(h);
     html = html.replace(/<table>/g, '<div class="table-wrap"><table>').replace(/<\/table>/g, "</table></div>");
     return { md, html };
   }
@@ -1163,6 +1455,10 @@ figure.asset img{max-width:min(100%,600px);border-radius:24px;display:block}
 footer{margin-top:56px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
 footer code{overflow-wrap:anywhere}
 @media (max-width:560px){.bubble{max-width:90%}.gallery a{flex-basis:45%}.gallery img{height:160px}.product{flex-basis:240px}}
+@media (max-width:560px){.cgx-ui-grid{grid-template-columns:minmax(0,1fr)!important}}
+.cgx-ui-box,.cgx-ui-grid,.cgx-ui-row{--cgx-ui-surface:var(--chip);--cgx-ui-secondary:var(--card);--cgx-ui-tertiary:var(--line)}
+.body [class^="cgx-ui-"]>p{margin:0}.body [class^="cgx-ui-"] svg{max-width:100%;height:auto}
+.cgx-ui-checkbox input,.cgx-ui-radio input{accent-color:#0d9488;margin-right:8px}
 `;
 
   function safeName(conv) {
